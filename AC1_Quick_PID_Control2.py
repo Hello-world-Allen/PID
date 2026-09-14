@@ -48,24 +48,36 @@ SP_RETURN = 34.0
 #    對於每一台 AC，只要該台發生以下任一條件：
 #       Supply_air_T > 30°C
 #       return_air_T > 40°C
-#    就只停止該台 AC 的過熱實驗，並立即將該台 AC 恢復成
+#    不會立即進入恢復模式，而是開始計算超溫持續時間。
+#
+# 4. 若該台 AC 的供氣溫度 > 30°C 或回氣溫度 > 40°C，
+#    且任一超溫條件連續維持滿 5 分鐘仍未降回門檻內，
+#    才停止該台 AC 的過熱實驗，並將該台 AC 恢復成
 #    正常設定值 23 / 34°C。
-#    其他 AC 若尚未超過門檻，則繼續維持 28 / 38°C 的過熱實驗。
 #
-# 4. 某一台 AC 一旦觸發溫度門檻，該台 AC 在當次實驗時段剩餘時間內
-#    都維持正常設定值，不會在下一個 30 秒控制週期重新進入過熱模式。
+# 5. 若在 5 分鐘內供氣與回氣溫度都降回門檻內，
+#    則清除該台 AC 的超溫計時，並繼續原本的過熱實驗。
+#    之後若再次超過門檻，會重新從 0 分鐘開始計時。
 #
-# 5. 若整個實驗時段內都沒有觸發門檻，則在 11:00 或 16:00 時，
-#    AC1、AC2 與 AC3 都會自動恢復正常設定值 23 / 34°C。
+# 6. 某一台 AC 因連續超溫 5 分鐘而進入恢復模式後，
+#    該台 AC 在當次實驗時段剩餘時間內都維持正常設定值，
+#    不會在下一個 30 秒控制週期重新進入過熱模式。
+#    其他尚未觸發條件的 AC 不受影響，仍可繼續過熱實驗。
 #
-# 6. 若實驗期間某一台 AC 的溫度資料讀取不到，為了安全起見，
-#    只停止該台 AC 的過熱實驗並恢復正常設定值；其他 AC 不受影響。
+# 7. 若整個實驗時段內都沒有觸發連續超溫 5 分鐘的條件，
+#    則在 11:00 或 16:00 時，AC1、AC2 與 AC3 都會自動恢復
+#    正常設定值 23 / 34°C。
+#
+# 8. 若實驗期間某一台 AC 的溫度資料讀取不到，為了安全起見，
+#    不等待 5 分鐘，直接停止該台 AC 的過熱實驗並恢復正常設定值；
+#    其他 AC 不受影響。
 # =========================
 OVERHEAT_SP_SUPPLY = 28.0
 OVERHEAT_SP_RETURN = 38.0
 
 OVERHEAT_SUPPLY_LIMIT = 30.0
 OVERHEAT_RETURN_LIMIT = 40.0
+OVERHEAT_HOLD_SECONDS = 5 * 60
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
@@ -198,22 +210,25 @@ def get_active_experiment(now: datetime):
     return None
 
 
-def get_overheat_cutoff_reason(ac_id: int, supply_t, return_t):
-    """檢查單一 AC 是否應停止過熱實驗，若需要則回傳原因。"""
+def get_overheat_exceed_reason(ac_id: int, supply_t, return_t):
+    """檢查單一 AC 目前是否超過溫度門檻，若超過則回傳原因。"""
     if supply_t is None or return_t is None:
-        return f"AC{ac_id} 溫度資料缺失"
+        return None
+
+    reasons = []
 
     if supply_t > OVERHEAT_SUPPLY_LIMIT:
-        return (
-            f"AC{ac_id} 供氣溫度={supply_t:.1f}C "
-            f"> {OVERHEAT_SUPPLY_LIMIT:.1f}C"
+        reasons.append(
+            f"供氣溫度={supply_t:.1f}C > {OVERHEAT_SUPPLY_LIMIT:.1f}C"
         )
 
     if return_t > OVERHEAT_RETURN_LIMIT:
-        return (
-            f"AC{ac_id} 回氣溫度={return_t:.1f}C "
-            f"> {OVERHEAT_RETURN_LIMIT:.1f}C"
+        reasons.append(
+            f"回氣溫度={return_t:.1f}C > {OVERHEAT_RETURN_LIMIT:.1f}C"
         )
+
+    if reasons:
+        return f"AC{ac_id} " + "，".join(reasons)
 
     return None
 
@@ -261,10 +276,15 @@ def send_commands(commands):
 
 
 def main():
-    # 記錄本次程式執行期間，哪些 AC 已在某個實驗時段觸發停止條件。
+    # 記錄本次程式執行期間，哪些 AC 已在某個實驗時段進入恢復模式。
     # key 格式：(日期, 實驗名稱, AC 編號)
     # 例如：(2026-09-14, "morning", 1)
     stopped_ac_experiments = set()
+
+    # 記錄每台 AC 在當次實驗中「開始連續超溫」的時間。
+    # 只有在供氣 > 30°C 或回氣 > 40°C 時才會開始計時；
+    # 若供氣與回氣都降回門檻內，該台 AC 的計時會被清除。
+    overheat_started_at = {}
 
     while True:
         t0 = time.time()
@@ -297,25 +317,73 @@ def main():
                 and experiment_key not in stopped_ac_experiments
             )
 
-            # 只檢查該台 AC 自己的溫度門檻。
             if experiment_allowed:
-                cutoff_reason = get_overheat_cutoff_reason(
-                    ac_id,
-                    supply_t,
-                    return_t,
-                )
-
-                if cutoff_reason is not None:
+                # 溫度資料缺失時不等待 5 分鐘，直接恢復正常設定值。
+                if supply_t is None or return_t is None:
                     stopped_ac_experiments.add(experiment_key)
+                    overheat_started_at.pop(experiment_key, None)
                     experiment_allowed = False
 
                     print(
                         f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
-                        f"[安全切換] {cutoff_reason} -> "
+                        f"[安全切換] AC{ac_id} 溫度資料缺失 -> "
                         f"只將 AC{ac_id} 恢復為 "
                         f"SupplySP={SP_SUPPLY:.1f}C, "
                         f"ReturnSP={SP_RETURN:.1f}C"
                     )
+                else:
+                    exceed_reason = get_overheat_exceed_reason(
+                        ac_id,
+                        supply_t,
+                        return_t,
+                    )
+
+                    if exceed_reason is not None:
+                        # 第一次超過門檻時開始計時，之後持續累計。
+                        if experiment_key not in overheat_started_at:
+                            overheat_started_at[experiment_key] = now
+
+                            print(
+                                f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"[超溫計時開始] {exceed_reason}，"
+                                f"連續維持 5 分鐘才進入恢復模式。"
+                            )
+
+                        overheat_seconds = (
+                            now - overheat_started_at[experiment_key]
+                        ).total_seconds()
+
+                        # 連續超溫滿 5 分鐘後，才讓該台 AC 進入恢復模式。
+                        if overheat_seconds >= OVERHEAT_HOLD_SECONDS:
+                            stopped_ac_experiments.add(experiment_key)
+                            overheat_started_at.pop(experiment_key, None)
+                            experiment_allowed = False
+
+                            print(
+                                f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"[安全切換] {exceed_reason}，"
+                                f"已連續超溫 {overheat_seconds / 60.0:.1f} 分鐘 -> "
+                                f"只將 AC{ac_id} 恢復為 "
+                                f"SupplySP={SP_SUPPLY:.1f}C, "
+                                f"ReturnSP={SP_RETURN:.1f}C"
+                            )
+                        else:
+                            print(
+                                f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"[超溫監測] AC{ac_id} 已連續超溫 "
+                                f"{overheat_seconds / 60.0:.1f} / 5.0 分鐘，"
+                                f"暫不切換設定值。"
+                            )
+                    else:
+                        # 5 分鐘內若兩個溫度都回到門檻內，就重新計時。
+                        if experiment_key in overheat_started_at:
+                            overheat_started_at.pop(experiment_key, None)
+
+                            print(
+                                f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                                f"[超溫解除] AC{ac_id} 已降回門檻內，"
+                                f"5 分鐘超溫計時重置。"
+                            )
 
             # 每台 AC 分別決定目前要使用過熱設定值或正常設定值。
             if experiment_allowed:
