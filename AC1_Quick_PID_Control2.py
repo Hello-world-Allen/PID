@@ -1,4 +1,7 @@
 import time
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import grequests
 from influxdb_client import InfluxDBClient
@@ -19,8 +22,59 @@ BASE_URL = f"http://{API_IP}:8000/control/ac/"
 AC_IDS = (1, 2)
 INTERVAL_S = 30
 
+# =========================
+# Normal PID setpoints
+# =========================
 SP_SUPPLY = 23.0
 SP_RETURN = 34.0
+
+# =========================
+# Scheduled overheating experiment
+# =========================
+# Experiment control flow:
+#
+# 1. Normal operation:
+#       Supply SP = 23 C
+#       Return SP = 34 C
+#
+# 2. Every day, two experiment windows are scheduled using Asia/Taipei time:
+#       10:00 ~ 11:00
+#       15:00 ~ 16:00
+#    During the experiment window, both AC1 and AC2 use:
+#       Supply SP = 28 C
+#       Return SP = 38 C
+#
+# 3. During an experiment, the actual temperatures of BOTH ACs are checked
+#    every control cycle. If ANY one of the following occurs:
+#       AC1/AC2 Supply_air_T > 30 C
+#       AC1/AC2 return_air_T > 40 C
+#    the experiment is immediately stopped and BOTH ACs return to the
+#    normal setpoints (23 / 34 C).
+#
+# 4. Once a safety cutoff is triggered, that experiment window is latched
+#    off for the rest of the current window. It will NOT re-enter the
+#    overheating setpoints on the next 30-second cycle.
+#
+# 5. If no cutoff occurs, the experiment ends automatically when the
+#    scheduled window ends, and the normal setpoints are restored.
+#
+# 6. If temperature data for either AC is missing during an experiment,
+#    the experiment is also stopped for that window and normal setpoints
+#    are used as a fail-safe.
+# =========================
+OVERHEAT_SP_SUPPLY = 28.0
+OVERHEAT_SP_RETURN = 38.0
+
+OVERHEAT_SUPPLY_LIMIT = 30.0
+OVERHEAT_RETURN_LIMIT = 40.0
+
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
+EXPERIMENT_WINDOWS = (
+    ("morning", dt_time(10, 0), dt_time(11, 0)),
+    ("afternoon", dt_time(15, 0), dt_time(16, 0)),
+)
+
 OUT_MIN, OUT_MAX = 30, 100
 
 ENABLE_SUPPLY_GT = 21.5
@@ -38,7 +92,7 @@ def make_pid_pair():
     return pid_ball, pid_fan
 
 
-# 每台 AC 都要有自己的 PID 內部狀態，避免積分項互相干擾
+# Each AC has its own PID internal state so integral/history do not interfere.
 PID_CONTROLLERS = {
     ac_id: make_pid_pair()
     for ac_id in AC_IDS
@@ -134,6 +188,45 @@ def get_ac_latest_temps(df_long: pd.DataFrame, ac_id: int):
     return supply, ret
 
 
+def get_active_experiment(now: datetime):
+    """Return the current experiment name, or None outside experiment windows."""
+    current_time = now.time().replace(tzinfo=None)
+
+    for name, start_time, end_time in EXPERIMENT_WINDOWS:
+        if start_time <= current_time < end_time:
+            return name
+
+    return None
+
+
+def get_overheat_cutoff_reason(readings):
+    """Return a cutoff reason if any AC exceeds the experiment safety limits."""
+    for ac_id, (supply_t, return_t) in readings.items():
+        if supply_t is None or return_t is None:
+            return f"AC{ac_id} temperature data missing"
+
+        if supply_t > OVERHEAT_SUPPLY_LIMIT:
+            return (
+                f"AC{ac_id} Supply={supply_t:.1f}C "
+                f"> {OVERHEAT_SUPPLY_LIMIT:.1f}C"
+            )
+
+        if return_t > OVERHEAT_RETURN_LIMIT:
+            return (
+                f"AC{ac_id} Return={return_t:.1f}C "
+                f"> {OVERHEAT_RETURN_LIMIT:.1f}C"
+            )
+
+    return None
+
+
+def set_all_pid_setpoints(supply_sp: float, return_sp: float):
+    """Apply the same experiment/normal setpoints to AC1 and AC2 PID objects."""
+    for pid_ball, pid_fan in PID_CONTROLLERS.values():
+        pid_ball.setpoint = supply_sp
+        pid_fan.setpoint = return_sp
+
+
 def send_commands(commands):
     reqs = []
 
@@ -162,7 +255,7 @@ def send_commands(commands):
             )
         )
 
-    # AC1 / AC2 的 4 個命令在同一批 request 中送出
+    # AC1 / AC2 commands are sent in the same request batch.
     grequests.map(
         reqs,
         size=len(reqs),
@@ -170,19 +263,81 @@ def send_commands(commands):
 
 
 def main():
+    # Stores experiment windows that have already hit a cutoff during this run.
+    # Key format: (date, experiment_name), e.g. (2026-09-14, "morning").
+    stopped_experiments = set()
+
     while True:
         t0 = time.time()
+        now = datetime.now(TAIPEI_TZ)
 
-        # 每個週期只查一次資料庫
+        # Query the database once per control cycle.
         df = query_to_dataframe()
+
+        # Read AC1 and AC2 temperatures before deciding the current setpoints.
+        readings = {
+            ac_id: get_ac_latest_temps(df, ac_id)
+            for ac_id in AC_IDS
+        }
+
+        active_experiment = get_active_experiment(now)
+        experiment_key = (
+            (now.date(), active_experiment)
+            if active_experiment is not None
+            else None
+        )
+
+        experiment_allowed = (
+            active_experiment is not None
+            and experiment_key not in stopped_experiments
+        )
+
+        cutoff_reason = None
+
+        if experiment_allowed:
+            cutoff_reason = get_overheat_cutoff_reason(readings)
+
+            if cutoff_reason is not None:
+                stopped_experiments.add(experiment_key)
+                experiment_allowed = False
+
+                print(
+                    f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"[SAFETY CUTOFF] {cutoff_reason} -> "
+                    f"restore SP to Supply={SP_SUPPLY:.1f}C, "
+                    f"Return={SP_RETURN:.1f}C"
+                )
+
+        if experiment_allowed:
+            current_supply_sp = OVERHEAT_SP_SUPPLY
+            current_return_sp = OVERHEAT_SP_RETURN
+            mode = f"OVERHEAT:{active_experiment}"
+        else:
+            current_supply_sp = SP_SUPPLY
+            current_return_sp = SP_RETURN
+
+            if active_experiment is not None:
+                mode = f"RECOVERY:{active_experiment}"
+            else:
+                mode = "NORMAL"
+
+        # Update both AC PID objects with the selected setpoints.
+        set_all_pid_setpoints(
+            current_supply_sp,
+            current_return_sp,
+        )
+
+        print(
+            f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"Mode={mode} | "
+            f"SupplySP={current_supply_sp:.1f}C "
+            f"ReturnSP={current_return_sp:.1f}C"
+        )
 
         commands = {}
 
         for ac_id in AC_IDS:
-            supply_t, return_t = get_ac_latest_temps(
-                df,
-                ac_id,
-            )
+            supply_t, return_t = readings[ac_id]
 
             valve_cmd = HOLD_OUTPUT
             fan_cmd = HOLD_OUTPUT
