@@ -94,7 +94,7 @@ HOLD_OUTPUT = 20.0
 
 
 def make_pid_pair():
-    pid_ball = PID(-4.0, -0.05, 0.0, setpoint=SP_SUPPLY)
+    pid_ball = PID(-3.0, -0.05, 0.0, setpoint=SP_SUPPLY)
     pid_ball.output_limits = (OUT_MIN, OUT_MAX)
 
     pid_fan = PID(-4.0, -0.05, 0.0, setpoint=SP_RETURN)
