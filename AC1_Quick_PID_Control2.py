@@ -74,11 +74,11 @@ EXPERIMENT_WINDOWS = (
     ("afternoon", dt_time(15, 0), dt_time(16, 0)),
 )
 
-OUT_MIN, OUT_MAX = 30, 100
+OUT_MIN, OUT_MAX = 20, 100
 
 ENABLE_SUPPLY_GT = 21.5
 ENABLE_RETURN_GT = 31.0
-HOLD_OUTPUT = 30.0
+HOLD_OUTPUT = 20.0
 
 
 def make_pid_pair():
