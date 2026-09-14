@@ -23,44 +23,43 @@ AC_IDS = (1, 2)
 INTERVAL_S = 30
 
 # =========================
-# Normal PID setpoints
+# 正常 PID 設定值
 # =========================
 SP_SUPPLY = 23.0
 SP_RETURN = 34.0
 
 # =========================
-# Scheduled overheating experiment
+# 定時過熱實驗設定
 # =========================
-# Experiment control flow:
+# 實驗控制流程：
 #
-# 1. Normal operation:
-#       Supply SP = 23 C
-#       Return SP = 34 C
+# 1. 正常運轉：
+#       供氣溫度設定值 = 23°C
+#       回氣溫度設定值 = 34°C
 #
-# 2. Every day, two experiment windows are scheduled using Asia/Taipei time:
-#       10:00 ~ 11:00
-#       15:00 ~ 16:00
-#    During the experiment window, both AC1 and AC2 use:
-#       Supply SP = 28 C
-#       Return SP = 38 C
+# 2. 每天使用台灣時間進行兩次過熱實驗：
+#       上午 10:00 ~ 11:00
+#       下午 15:00 ~ 16:00
+#    在實驗時段內，AC1 與 AC2 各自使用：
+#       供氣溫度設定值 = 28°C
+#       回氣溫度設定值 = 38°C
 #
-# 3. During an experiment, the actual temperatures of BOTH ACs are checked
-#    every control cycle. If ANY one of the following occurs:
-#       AC1/AC2 Supply_air_T > 30 C
-#       AC1/AC2 return_air_T > 40 C
-#    the experiment is immediately stopped and BOTH ACs return to the
-#    normal setpoints (23 / 34 C).
+# 3. 實驗期間每 30 秒分別檢查 AC1 與 AC2 的實際溫度。
+#    對於每一台 AC，只要該台發生以下任一條件：
+#       Supply_air_T > 30°C
+#       return_air_T > 40°C
+#    就只停止該台 AC 的過熱實驗，並立即將該台 AC 恢復成
+#    正常設定值 23 / 34°C。
+#    另一台 AC 若尚未超過門檻，則繼續維持 28 / 38°C 的過熱實驗。
 #
-# 4. Once a safety cutoff is triggered, that experiment window is latched
-#    off for the rest of the current window. It will NOT re-enter the
-#    overheating setpoints on the next 30-second cycle.
+# 4. 某一台 AC 一旦觸發溫度門檻，該台 AC 在當次實驗時段剩餘時間內
+#    都維持正常設定值，不會在下一個 30 秒控制週期重新進入過熱模式。
 #
-# 5. If no cutoff occurs, the experiment ends automatically when the
-#    scheduled window ends, and the normal setpoints are restored.
+# 5. 若整個實驗時段內都沒有觸發門檻，則在 11:00 或 16:00 時，
+#    AC1 與 AC2 都會自動恢復正常設定值 23 / 34°C。
 #
-# 6. If temperature data for either AC is missing during an experiment,
-#    the experiment is also stopped for that window and normal setpoints
-#    are used as a fail-safe.
+# 6. 若實驗期間某一台 AC 的溫度資料讀取不到，為了安全起見，
+#    只停止該台 AC 的過熱實驗並恢復正常設定值；另一台 AC 不受影響。
 # =========================
 OVERHEAT_SP_SUPPLY = 28.0
 OVERHEAT_SP_RETURN = 38.0
@@ -92,7 +91,7 @@ def make_pid_pair():
     return pid_ball, pid_fan
 
 
-# Each AC has its own PID internal state so integral/history do not interfere.
+# 每台 AC 都使用自己的 PID 內部狀態，避免積分項與歷史狀態互相干擾。
 PID_CONTROLLERS = {
     ac_id: make_pid_pair()
     for ac_id in AC_IDS
@@ -189,7 +188,7 @@ def get_ac_latest_temps(df_long: pd.DataFrame, ac_id: int):
 
 
 def get_active_experiment(now: datetime):
-    """Return the current experiment name, or None outside experiment windows."""
+    """判斷目前是否位於實驗時段，若是則回傳實驗名稱，否則回傳 None。"""
     current_time = now.time().replace(tzinfo=None)
 
     for name, start_time, end_time in EXPERIMENT_WINDOWS:
@@ -199,32 +198,31 @@ def get_active_experiment(now: datetime):
     return None
 
 
-def get_overheat_cutoff_reason(readings):
-    """Return a cutoff reason if any AC exceeds the experiment safety limits."""
-    for ac_id, (supply_t, return_t) in readings.items():
-        if supply_t is None or return_t is None:
-            return f"AC{ac_id} temperature data missing"
+def get_overheat_cutoff_reason(ac_id: int, supply_t, return_t):
+    """檢查單一 AC 是否應停止過熱實驗，若需要則回傳原因。"""
+    if supply_t is None or return_t is None:
+        return f"AC{ac_id} 溫度資料缺失"
 
-        if supply_t > OVERHEAT_SUPPLY_LIMIT:
-            return (
-                f"AC{ac_id} Supply={supply_t:.1f}C "
-                f"> {OVERHEAT_SUPPLY_LIMIT:.1f}C"
-            )
+    if supply_t > OVERHEAT_SUPPLY_LIMIT:
+        return (
+            f"AC{ac_id} 供氣溫度={supply_t:.1f}C "
+            f"> {OVERHEAT_SUPPLY_LIMIT:.1f}C"
+        )
 
-        if return_t > OVERHEAT_RETURN_LIMIT:
-            return (
-                f"AC{ac_id} Return={return_t:.1f}C "
-                f"> {OVERHEAT_RETURN_LIMIT:.1f}C"
-            )
+    if return_t > OVERHEAT_RETURN_LIMIT:
+        return (
+            f"AC{ac_id} 回氣溫度={return_t:.1f}C "
+            f"> {OVERHEAT_RETURN_LIMIT:.1f}C"
+        )
 
     return None
 
 
-def set_all_pid_setpoints(supply_sp: float, return_sp: float):
-    """Apply the same experiment/normal setpoints to AC1 and AC2 PID objects."""
-    for pid_ball, pid_fan in PID_CONTROLLERS.values():
-        pid_ball.setpoint = supply_sp
-        pid_fan.setpoint = return_sp
+def set_pid_setpoints(ac_id: int, supply_sp: float, return_sp: float):
+    """只更新指定 AC 的供氣與回氣 PID 設定值。"""
+    pid_ball, pid_fan = PID_CONTROLLERS[ac_id]
+    pid_ball.setpoint = supply_sp
+    pid_fan.setpoint = return_sp
 
 
 def send_commands(commands):
@@ -255,7 +253,7 @@ def send_commands(commands):
             )
         )
 
-    # AC1 / AC2 commands are sent in the same request batch.
+    # AC1 與 AC2 的控制命令會在同一批 request 中送出。
     grequests.map(
         reqs,
         size=len(reqs),
@@ -263,81 +261,82 @@ def send_commands(commands):
 
 
 def main():
-    # Stores experiment windows that have already hit a cutoff during this run.
-    # Key format: (date, experiment_name), e.g. (2026-09-14, "morning").
-    stopped_experiments = set()
+    # 記錄本次程式執行期間，哪些 AC 已在某個實驗時段觸發停止條件。
+    # key 格式：(日期, 實驗名稱, AC 編號)
+    # 例如：(2026-09-14, "morning", 1)
+    stopped_ac_experiments = set()
 
     while True:
         t0 = time.time()
         now = datetime.now(TAIPEI_TZ)
 
-        # Query the database once per control cycle.
+        # 每個控制週期只查詢一次資料庫。
         df = query_to_dataframe()
 
-        # Read AC1 and AC2 temperatures before deciding the current setpoints.
+        # 先分別讀取 AC1 與 AC2 的最新供氣與回氣溫度。
         readings = {
             ac_id: get_ac_latest_temps(df, ac_id)
             for ac_id in AC_IDS
         }
 
         active_experiment = get_active_experiment(now)
-        experiment_key = (
-            (now.date(), active_experiment)
-            if active_experiment is not None
-            else None
-        )
-
-        experiment_allowed = (
-            active_experiment is not None
-            and experiment_key not in stopped_experiments
-        )
-
-        cutoff_reason = None
-
-        if experiment_allowed:
-            cutoff_reason = get_overheat_cutoff_reason(readings)
-
-            if cutoff_reason is not None:
-                stopped_experiments.add(experiment_key)
-                experiment_allowed = False
-
-                print(
-                    f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
-                    f"[SAFETY CUTOFF] {cutoff_reason} -> "
-                    f"restore SP to Supply={SP_SUPPLY:.1f}C, "
-                    f"Return={SP_RETURN:.1f}C"
-                )
-
-        if experiment_allowed:
-            current_supply_sp = OVERHEAT_SP_SUPPLY
-            current_return_sp = OVERHEAT_SP_RETURN
-            mode = f"OVERHEAT:{active_experiment}"
-        else:
-            current_supply_sp = SP_SUPPLY
-            current_return_sp = SP_RETURN
-
-            if active_experiment is not None:
-                mode = f"RECOVERY:{active_experiment}"
-            else:
-                mode = "NORMAL"
-
-        # Update both AC PID objects with the selected setpoints.
-        set_all_pid_setpoints(
-            current_supply_sp,
-            current_return_sp,
-        )
-
-        print(
-            f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
-            f"Mode={mode} | "
-            f"SupplySP={current_supply_sp:.1f}C "
-            f"ReturnSP={current_return_sp:.1f}C"
-        )
-
         commands = {}
 
         for ac_id in AC_IDS:
             supply_t, return_t = readings[ac_id]
+
+            # 每台 AC 各自判斷是否仍允許執行目前的過熱實驗。
+            experiment_key = (
+                (now.date(), active_experiment, ac_id)
+                if active_experiment is not None
+                else None
+            )
+
+            experiment_allowed = (
+                active_experiment is not None
+                and experiment_key not in stopped_ac_experiments
+            )
+
+            # 只檢查該台 AC 自己的溫度門檻。
+            if experiment_allowed:
+                cutoff_reason = get_overheat_cutoff_reason(
+                    ac_id,
+                    supply_t,
+                    return_t,
+                )
+
+                if cutoff_reason is not None:
+                    stopped_ac_experiments.add(experiment_key)
+                    experiment_allowed = False
+
+                    print(
+                        f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        f"[安全切換] {cutoff_reason} -> "
+                        f"只將 AC{ac_id} 恢復為 "
+                        f"SupplySP={SP_SUPPLY:.1f}C, "
+                        f"ReturnSP={SP_RETURN:.1f}C"
+                    )
+
+            # 每台 AC 分別決定目前要使用過熱設定值或正常設定值。
+            if experiment_allowed:
+                current_supply_sp = OVERHEAT_SP_SUPPLY
+                current_return_sp = OVERHEAT_SP_RETURN
+                mode = f"過熱實驗:{active_experiment}"
+            else:
+                current_supply_sp = SP_SUPPLY
+                current_return_sp = SP_RETURN
+
+                if active_experiment is not None:
+                    mode = f"恢復模式:{active_experiment}"
+                else:
+                    mode = "正常模式"
+
+            # 只更新目前這台 AC 的 PID 設定值，不影響另一台 AC。
+            set_pid_setpoints(
+                ac_id,
+                current_supply_sp,
+                current_return_sp,
+            )
 
             valve_cmd = HOLD_OUTPUT
             fan_cmd = HOLD_OUTPUT
@@ -366,7 +365,11 @@ def main():
             )
 
             print(
+                f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] "
                 f"[AC{ac_id}] "
+                f"模式={mode} | "
+                f"SupplySP={current_supply_sp:.1f}C "
+                f"ReturnSP={current_return_sp:.1f}C | "
                 f"Supply={supply_t}C "
                 f"Return={return_t}C | "
                 f"ValveCmd={valve_cmd:.1f}% "
