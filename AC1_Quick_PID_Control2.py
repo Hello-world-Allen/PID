@@ -19,7 +19,7 @@ LOOKBACK = "-30m"
 API_IP = "192.168.7.240"
 BASE_URL = f"http://{API_IP}:8000/control/ac/"
 
-AC_IDS = (1, 2)
+AC_IDS = (1, 2, 3)
 INTERVAL_S = 30
 
 # =========================
@@ -40,26 +40,26 @@ SP_RETURN = 34.0
 # 2. 每天使用台灣時間進行兩次過熱實驗：
 #       上午 10:00 ~ 11:00
 #       下午 15:00 ~ 16:00
-#    在實驗時段內，AC1 與 AC2 各自使用：
+#    在實驗時段內，AC1、AC2 與 AC3 都會各自使用：
 #       供氣溫度設定值 = 28°C
 #       回氣溫度設定值 = 38°C
 #
-# 3. 實驗期間每 30 秒分別檢查 AC1 與 AC2 的實際溫度。
+# 3. 實驗期間每 30 秒分別檢查 AC1、AC2 與 AC3 的實際溫度。
 #    對於每一台 AC，只要該台發生以下任一條件：
 #       Supply_air_T > 30°C
 #       return_air_T > 40°C
 #    就只停止該台 AC 的過熱實驗，並立即將該台 AC 恢復成
 #    正常設定值 23 / 34°C。
-#    另一台 AC 若尚未超過門檻，則繼續維持 28 / 38°C 的過熱實驗。
+#    其他 AC 若尚未超過門檻，則繼續維持 28 / 38°C 的過熱實驗。
 #
 # 4. 某一台 AC 一旦觸發溫度門檻，該台 AC 在當次實驗時段剩餘時間內
 #    都維持正常設定值，不會在下一個 30 秒控制週期重新進入過熱模式。
 #
 # 5. 若整個實驗時段內都沒有觸發門檻，則在 11:00 或 16:00 時，
-#    AC1 與 AC2 都會自動恢復正常設定值 23 / 34°C。
+#    AC1、AC2 與 AC3 都會自動恢復正常設定值 23 / 34°C。
 #
 # 6. 若實驗期間某一台 AC 的溫度資料讀取不到，為了安全起見，
-#    只停止該台 AC 的過熱實驗並恢復正常設定值；另一台 AC 不受影響。
+#    只停止該台 AC 的過熱實驗並恢復正常設定值；其他 AC 不受影響。
 # =========================
 OVERHEAT_SP_SUPPLY = 28.0
 OVERHEAT_SP_RETURN = 38.0
@@ -253,7 +253,7 @@ def send_commands(commands):
             )
         )
 
-    # AC1 與 AC2 的控制命令會在同一批 request 中送出。
+    # AC1、AC2 與 AC3 的控制命令會在同一批 request 中送出。
     grequests.map(
         reqs,
         size=len(reqs),
@@ -273,7 +273,7 @@ def main():
         # 每個控制週期只查詢一次資料庫。
         df = query_to_dataframe()
 
-        # 先分別讀取 AC1 與 AC2 的最新供氣與回氣溫度。
+        # 先分別讀取 AC1、AC2 與 AC3 的最新供氣與回氣溫度。
         readings = {
             ac_id: get_ac_latest_temps(df, ac_id)
             for ac_id in AC_IDS
@@ -331,7 +331,7 @@ def main():
                 else:
                     mode = "正常模式"
 
-            # 只更新目前這台 AC 的 PID 設定值，不影響另一台 AC。
+            # 只更新目前這台 AC 的 PID 設定值，不影響其他 AC。
             set_pid_setpoints(
                 ac_id,
                 current_supply_sp,
