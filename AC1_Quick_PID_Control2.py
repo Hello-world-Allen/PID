@@ -1,4 +1,3 @@
-import os
 import time
 import pandas as pd
 import grequests
@@ -6,7 +5,7 @@ from influxdb_client import InfluxDBClient
 from simple_pid import PID
 
 INFLUX_URL = "http://192.168.7.139:8086"
-INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
+INFLUX_TOKEN = "lsTrnTXSD028sM0X5b_tVU34enPl0yzRftfEdYiaB_vWE8PM0qL_HahsJ8cxd4vuGJDjMUe3NxVzHLnbObheoA=="   # <-- 改成你的 token
 INFLUX_ORG = "NTHU"
 INFLUX_BUCKET = "test_bucket"
 
